@@ -60,7 +60,7 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x)
         return output * self.weight
 
 class Attention(nn.Module):
@@ -99,8 +99,8 @@ class Attention(nn.Module):
         score = query @ key.transpose(-2, -1) # (bs, n_local_heads, seqlen, seqlen)
         score = score / math.sqrt(self.head_dim)
         seqlen = query.shape[2]
-        mask = torch.tril(torch.ones(seqlen, seqlen, device=query.device)).bool().view(1, 1, seqlen, seqlen)
-        score = score.masked_fill(~mask, float('-inf'))
+        # mask = torch.tril(torch.ones(seqlen, seqlen, device=query.device)).bool().view(1, 1, seqlen, seqlen)
+        # score = score.masked_fill(~mask, float('-inf'))
         score = F.softmax(score, dim=-1) # (bs, n_local_heads, seqlen, seqlen)
         score = self.attn_dropout(score)
         attention = score @ value # (bs, n_local_heads, seqlen, head_dim)

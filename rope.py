@@ -58,8 +58,8 @@ def apply_rotary_emb(
     # and Section 3 in https://arxiv.org/abs/2104.09864.
 
     # reshape xq and xk to match the complex representation
-    query_real, query_imag = query.float().reshape(query.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
-    key_real, key_imag = key.float().reshape(key.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
+    query_real, query_imag = query.reshape(query.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
+    key_real, key_imag = key.reshape(key.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
     # This separates each query/key vector into its odd and even indices (assuming *one-indexing*).
     # query_real contains q_1, q_3, q_5, ... and query_imag contains q_2, q_4, q_6, ...
 
@@ -70,7 +70,7 @@ def apply_rotary_emb(
     # key_real, and key_imag.
     assert max_seq_len >= seqlen, f"max_seq_len {max_seq_len} must be >= seqlen {seqlen}"
     thetas = torch.arange(0, half_dim, device=device, dtype=query.dtype) / head_dim # (half_dim,)
-    thetas = torch.pow(10000, thetas * -2)  # (half_dim,)
+    thetas = torch.pow(theta, thetas * -2)  # (half_dim,)
     seq_indices = torch.arange(seqlen, device=device, dtype=query.dtype) # (seqlen,)
     freqs = seq_indices[:, None] * thetas[None, :]  # (seqlen, half_dim)
     consine = torch.cos(freqs)  # (seqlen, half_dim)
