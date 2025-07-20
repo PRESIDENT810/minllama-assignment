@@ -48,7 +48,9 @@ def apply_rotary_emb(
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
     """
 
-    _, seqlen, _, _ = query.shape
+    _, seqlen, n_heads, head_dim = query.shape # (b, s, n_heads, head_dim)
+    assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+    half_dim = head_dim // 2
     device = query.device
     # todo
     #
@@ -56,8 +58,8 @@ def apply_rotary_emb(
     # and Section 3 in https://arxiv.org/abs/2104.09864.
 
     # reshape xq and xk to match the complex representation
-    query_real, query_imag = query.float().reshape(query.shape[:-1] + (-1, 2)).unbind(-1)
-    key_real, key_imag = key.float().reshape(key.shape[:-1] + (-1, 2)).unbind(-1)
+    query_real, query_imag = query.float().reshape(query.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
+    key_real, key_imag = key.float().reshape(key.shape[:-1] + (-1, 2)).unbind(-1) # (b, s, n_heads, half_dim), (b, s, n_heads, half_dim)
     # This separates each query/key vector into its odd and even indices (assuming *one-indexing*).
     # query_real contains q_1, q_3, q_5, ... and query_imag contains q_2, q_4, q_6, ...
 
@@ -66,10 +68,26 @@ def apply_rotary_emb(
 
     # Then, combine these trigonometric values with the tensors query_real, query_imag,
     # key_real, and key_imag.
+    assert max_seq_len >= seqlen, f"max_seq_len {max_seq_len} must be >= seqlen {seqlen}"
+    thetas = torch.arange(0, half_dim, device=device, dtype=query.dtype) / head_dim # (half_dim,)
+    thetas = torch.pow(10000, thetas * -2)  # (half_dim,)
+    seq_indices = torch.arange(seqlen, device=device, dtype=query.dtype) # (seqlen,)
+    freqs = seq_indices[:, None] * thetas[None, :]  # (seqlen, half_dim)
+    consine = torch.cos(freqs)  # (seqlen, half_dim)
+    sine = torch.sin(freqs)  # (seqlen, half_dim)
+    consine = consine[None, :, None, :] # (1, seqlen, 1, half_dim)
+    sine = sine[None, :, None, :] # (1, seqlen, 1, half_dim)
 
-    raise NotImplementedError
+    def apply_rotary(x_real: torch.Tensor, x_imag: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply rotary embeddings to the real and imaginary parts of the input tensor.
+        """
+        real = consine * x_real - sine * x_imag  # (b, s, n_heads, half_dim)
+        imag = consine * x_imag + sine * x_real # (b, s, n_heads, half_dim)
+        return torch.stack((real, imag), dim=-1).flatten(-2)  # (b, s, n_heads, half_dim, 2)
 
-    query_out = None
-    key_out = None
+    query_out = apply_rotary(query_real, query_imag)  # (b, s, n_heads, half_dim, 2)
+    key_out = apply_rotary(key_real, key_imag)  # (b, s, n_heads, half_dim, 2)
+
     # Return the rotary position embeddings for the query and key tensors
     return query_out, key_out

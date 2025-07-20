@@ -44,7 +44,10 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
         """
         # todo
-        raise NotImplementedError
+        b, s, d = x.shape
+        rms = torch.sqrt(self.eps + torch.mean(x**2, dim=-1, keepdim=True)) # (b, s, 1)
+        assert rms.shape == (b, s, 1), f"Expected shape {(b, s, 1)}, got {rms.shape}"
+        return x / rms
 
     def forward(self, x):
         """
@@ -66,15 +69,15 @@ class Attention(nn.Module):
         self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
         assert config.n_heads % self.n_kv_heads == 0
         model_parallel_size = 1
-        self.n_local_heads = config.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_local_heads = config.n_heads // model_parallel_size # number of local Q heads per model parallel group
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size # number of local K & V heads per model parallel group
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # number of times to repeat keys and values
         self.head_dim = config.dim // config.n_heads
         self.max_seq_len = config.max_seq_len
-        self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False) # (b, s, d) -> (b, s, n_heads * head_dim)
+        self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False) # (b, s, d) -> (b, s, n_kv_heads * head_dim)
+        self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False) # (b, s, d) -> (b, s, n_kv_heads * head_dim)
+        self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False) # (b, s, n_heads * head_dim) -> (b, s, d)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
@@ -93,8 +96,15 @@ class Attention(nn.Module):
         Make sure to use attention_dropout (self.attn_dropout) on the computed
         attention matrix before applying it to the value tensor.
         '''
-        # todo
-        raise NotImplementedError
+        score = query @ key.transpose(-2, -1) # (bs, n_local_heads, seqlen, seqlen)
+        score = score / math.sqrt(self.head_dim)
+        seqlen = query.shape[2]
+        mask = torch.tril(torch.ones(seqlen, seqlen, device=query.device)).bool().view(1, 1, seqlen, seqlen)
+        score = score.masked_fill(~mask, float('-inf'))
+        score = F.softmax(score, dim=-1) # (bs, n_local_heads, seqlen, seqlen)
+        score = self.attn_dropout(score)
+        attention = score @ value # (bs, n_local_heads, seqlen, head_dim)
+        return attention
 
     def forward(
         self,
@@ -109,14 +119,14 @@ class Attention(nn.Module):
         https://ai.plainenglish.io/understanding-llama2-kv-cache-grouped-query-attention-rotary-embedding-and-more-c17e5f49a6d7
         for details.
         '''
-        batch_size, seqlen, _ = x.shape
+        batch_size, seqlen, _ = x.shape # (b, s, d)
 
-        query = self.compute_query(x)
-        key = self.compute_key(x)
-        value = self.compute_value(x)
-        query = query.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
-        key = key.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
-        value = value.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
+        query = self.compute_query(x) # (b, s, n_heads * head_dim)
+        key = self.compute_key(x) # (b, s, n_kv_heads * head_dim)
+        value = self.compute_value(x) # (b, s, n_kv_heads * head_dim)
+        query = query.view(batch_size, seqlen, self.n_local_heads, self.head_dim) # (b, s, n_local_heads, head_dim)
+        key = key.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim) # (b, s, n_local_kv_heads, head_dim)
+        value = value.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim) # (b, s, n_local_kv_heads, head_dim)
 
         # RoPE relative positional embeddings
         query, key = apply_rotary_emb(query, key, self.head_dim, self.max_seq_len)
@@ -124,14 +134,14 @@ class Attention(nn.Module):
         # Grouped multiquery attention: expand out keys and values.
         # Convert both to:
         # (bs, seqlen, n_local_heads, head_dim)
-        key = torch.repeat_interleave(key, dim=2, repeats=self.n_rep)
-        value = torch.repeat_interleave(value, dim=2, repeats=self.n_rep)
+        key = torch.repeat_interleave(key, dim=2, repeats=self.n_rep) # (bs, seqlen, n_local_heads, head_dim)
+        value = torch.repeat_interleave(value, dim=2, repeats=self.n_rep) # (bs, seqlen, n_local_heads, head_dim)
 
         # make heads into a batch dimension
         query = query.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        output = self.compute_query_key_value_scores(query, key, value)
+        key = key.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
+        value = value.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
+        output = self.compute_query_key_value_scores(query, key, value) # (bs, n_local_heads, seqlen, head_dim)
 
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
@@ -196,8 +206,14 @@ class LlamaLayer(nn.Module):
         5) add a residual connection from the unnormalized self-attention output to the
            output of the feed-forward network
         '''
-        # todo
-        raise NotImplementedError
+
+        b, s, d = x.shape
+        assert d == self.dim, f"Expected input dimension {self.dim}, got {d}"
+        x_norm = self.attention_norm(x)  # (b, s, d)
+        x = x + self.attention(x_norm)
+        x_norm = self.ffn_norm(x)
+        x = x + self.feed_forward(x_norm)
+        return x  # (b, s, d)
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -240,8 +256,8 @@ class Llama(LlamaPreTrainedModel):
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _batch_size, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        h = self.dropout(h)
+        h = self.tok_embeddings(tokens) # (b, s, d)
+        h = self.dropout(h) # (b, s, d)
 
         for layer in self.layers:
             h = layer(h)
@@ -249,10 +265,10 @@ class Llama(LlamaPreTrainedModel):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
+            logits = self.output(h) # (b, s, vocab_size)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim # (b, 1, vocab_size)
 
         return logits, h
 
@@ -267,18 +283,17 @@ class Llama(LlamaPreTrainedModel):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         Also note this is a super inefficient version of sampling with no key/value cache.
         """
+        self.eval() # set the model to evaluation mode
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond) # (b, s, vocab_size)
             logits = logits[:, -1, :] # crop to just the final time step
-            # todo
-            raise NotImplementedError
 
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True) # (b, 1)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,7 +304,10 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                logits = logits / temperature # (b, vocab_size)
+                probs = F.softmax(logits, dim=-1) # (b, vocab_size)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
